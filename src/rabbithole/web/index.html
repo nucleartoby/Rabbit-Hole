@@ -104,6 +104,22 @@ const CARD_W = 340;
 const nodes = [];
 let view = { x: innerWidth / 2, y: innerHeight / 2, scale: 1 };
 
+const RECENT_TREES = 2;
+const recentTrees = [];
+
+const titleKey = title => title.replace(/_/g, ' ').trim().replace(/\s+/g, ' ').toLowerCase();
+
+function suppressed() {
+  const blocked = new Map();
+  for (const tree of recentTrees) for (const title of tree) blocked.set(titleKey(title), title);
+  for (const node of nodes) blocked.set(titleKey(node.title), node.title);
+  return [...blocked.values()];}
+
+function rememberTree() {
+  if (!nodes.length) return;
+  recentTrees.push(nodes.map(node => node.title));
+  while (recentTrees.length > RECENT_TREES) recentTrees.shift();}
+
 function applyView() {
   world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;}
 
@@ -123,10 +139,10 @@ function addNode(entry, parent) {
   world.appendChild(node.el);
   return node;}
 
-function ancestors(node) {
-  const seen = new Set();
-  for (let n = node; n; n = n.parent) seen.add(n.title);
-  return seen;}
+function trail(node) {
+  const path = [];
+  for (let n = node; n; n = n.parent) path.unshift(n.title);
+  return path;}
 
 function descendants(node, out = []) {
   for (const child of node.children) { out.push(child); descendants(child, out); }
@@ -216,10 +232,14 @@ async function toggle(node) {
 
   node.el.classList.add('loading');
   try {
-    const seen = ancestors(node);
-    const hole = await fetchHole(node.title, 8);
+    const hole = await fetchHole(node.title, 8, trail(node.parent), suppressed());
+    // The server has already dropped these, but redirects can still land two
+    // spellings on one page, so the canvas gets the last word on its own state.
+    const onCanvas = new Set(nodes.map(n => titleKey(n.title)));
     for (const entry of hole.more) {
-      if (!seen.has(entry.title)) addNode(entry, node);}
+      if (!onCanvas.has(titleKey(entry.title))) {
+        onCanvas.add(titleKey(entry.title));
+        addNode(entry, node);}}
 
     node.open = true;
     if (!node.children.length) status.textContent = `“${node.title}” is a dead end.`;
@@ -230,8 +250,17 @@ async function toggle(node) {
   } finally {
     node.el.classList.remove('loading');}}
 
-async function fetchHole(term, limit) {
-  const res = await fetch(`/api/dig?term=${encodeURIComponent(term)}&limit=${limit}`);
+// ?stage=search reproduces the original lexical behaviour for side-by-side
+// comparison; omitted, the server picks its configured default.
+const stageOverride = new URLSearchParams(location.search).get('stage');
+
+async function fetchHole(term, limit, path = [], exclude = []) {
+  const query = new URLSearchParams({ term, limit });
+  if (path.length) query.set('path', path.join('|'));
+  if (exclude.length) query.set('exclude', exclude.join('|'));
+  if (stageOverride) query.set('stage', stageOverride);
+
+  const res = await fetch('/api/dig?' + query);
   if (!res.ok) throw new Error(`Nothing found for “${term}”.`);
   return res.json();}
 
@@ -240,17 +269,20 @@ async function search(term) {
   history.replaceState(null, '', '?q=' + encodeURIComponent(term));
   let hole;
   try {
-    hole = await fetchHole(term, 10);} catch (err) {status.textContent = err.message;
+    hole = await fetchHole(term, 10, [], suppressed());} catch (err) {status.textContent = err.message;
     return;}
 
+  rememberTree();
   nodes.forEach(n => n.el.remove());
   nodes.length = 0;
 
   const root = addNode(hole.top, null);
   root.open = true;
-  const seen = new Set([hole.top.title]);
+  const seen = new Set([titleKey(hole.top.title)]);
   for (const entry of hole.more) {
-    if (!seen.has(entry.title)) addNode(entry, root);
+    if (!seen.has(titleKey(entry.title))) {
+      seen.add(titleKey(entry.title));
+      addNode(entry, root);}
   }
   place(root);
   draw();
