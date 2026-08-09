@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import re
 import sqlite3
 import time
 import requests
@@ -7,6 +8,8 @@ from rabbithole import config
 
 _session = requests.Session()
 _session.headers["User-Agent"] = config.USER_AGENT
+
+_WIKILINK = re.compile(r"\[\[([^\]|#<>]+)")
 
 
 def _cache() -> sqlite3.Connection:
@@ -49,6 +52,70 @@ def _query(**params) -> dict:
 def search(term: str, limit: int = 20) -> list[dict]:
     body = _query(list="search", srsearch=term, srlimit=limit, srnamespace=0)
     return body.get("query", {}).get("search", [])
+
+
+def morelike(title: str, limit: int = 20) -> list[dict]:
+    body = _query(
+        list="search", srsearch=f"morelike:{title}", srlimit=limit, srnamespace=0)
+    return body.get("query", {}).get("search", [])
+
+
+def lead_links(title: str) -> list[str]:
+    body = _query(
+        titles=title, prop="revisions", rvprop="content", rvslots="main", rvsection=0,
+        redirects=1,)
+    pages = body.get("query", {}).get("pages", [])
+    if not pages or "missing" in pages[0]:
+        return []
+
+    revisions = pages[0].get("revisions") or []
+    if not revisions:
+        return []
+
+    wikitext = revisions[0].get("slots", {}).get("main", {}).get("content", "")
+    found: list[str] = []
+    for target in _WIKILINK.findall(wikitext):
+        target = target.strip()
+        # Transportation is a categor/interwiki sigil not an article link
+        if target and not target.startswith(":") and ":" not in target:
+            cleaned = target[0].upper() + target[1:]
+            if cleaned not in found:
+                found.append(cleaned)
+
+    return found
+
+
+def all_links(title: str, pages_deep: int = 2) -> set[str]:
+    found: set[str] = set()
+    continuation: dict = {}
+
+    for _ in range(pages_deep):
+        body = _query(
+            titles=title, prop="links", plnamespace=0, pllimit=500, redirects=1,
+            **continuation,)
+        for page in body.get("query", {}).get("pages", []):
+            found.update(link["title"] for link in page.get("links", []))
+
+        if "continue" not in body:
+            break
+        continuation = body["continue"]
+
+    return found
+
+
+def categories(titles: list[str]) -> dict[str, set[str]]:
+    found: dict[str, set[str]] = {}
+
+    for batch in (titles[i : i + 20] for i in range(0, len(titles), 20)):
+        body = _query(
+            titles="|".join(batch), prop="categories", cllimit=500, clshow="!hidden",
+            redirects=1,)
+        for page in body.get("query", {}).get("pages", []):
+            if "missing" not in page:
+                found[page["title"]] = {
+                    category["title"] for category in page.get("categories", [])}
+
+    return found
 
 
 def pages(titles: list[str]) -> dict[str, dict]:
