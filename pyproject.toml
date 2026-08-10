@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rabbithole"
+version = "0.1.0"
+description = "Enter a word, fall down a Wikipedia rabbit hole."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "nucleartoby" }]
+keywords = ["wikipedia", "exploration", "fastapi"]
+
+dependencies = [
+    "fastapi>=0.115",
+    "numpy>=1.26",  # tf-idf vectors and the ranking maths in relate.py
+    "requests>=2.32",
+    "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx2",       # backs fastapi.testclient; starlette deprecates plain httpx
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+# Swaps the tf-idf vectoriser for MiniLM sentence embeddings; pulls in torch, so
+# it is kept out of the default install. RABBITHOLE_VECTORS=minilm to switch.
+nlp = [
+    "sentence-transformers>=3.0",
+]
+
+[project.scripts]
+rabbithole = "rabbithole.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rabbithole"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["notebooks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["network: hits the live Wikipedia API (deselected by default)"]
+addopts = "-m 'not network'"
