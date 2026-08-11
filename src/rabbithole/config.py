@@ -3,13 +3,17 @@ import os
 from pathlib import Path
 
 
-CONTACT = os.getenv("RABBITHOLE_CONTACT", "emailaddress@gmail.com")
+CONTACT = os.getenv("RABBITHOLE_CONTACT", "email.address@gmail.com")
 USER_AGENT = f"RabbitHole/0.1 ({CONTACT})"
 
 WIKIPEDIA_API = os.getenv("RABBITHOLE_WIKIPEDIA_API", "https://en.wikipedia.org/w/api.php")
 
 CACHE_TTL = int(os.getenv("RABBITHOLE_CACHE_TTL", 60 * 60 * 24 * 7))
 REQUEST_TIMEOUT = float(os.getenv("RABBITHOLE_TIMEOUT", 10))
+
+STAGE = os.getenv("RABBITHOLE_STAGE", "ranked")
+
+VECTOR_BACKEND = os.getenv("RABBITHOLE_VECTORS", "tfidf")
 
 
 def cache_path() -> Path:
