@@ -8,9 +8,17 @@ client = TestClient(api.app)
 
 @pytest.fixture
 def digs(monkeypatch):
+    calls = []
 
     def install(hole):
-        monkeypatch.setattr(api, "dig", lambda term, limit: hole)
+        def fake(term, limit, stage=None, path=None, exclude=None):
+            calls.append({
+                "term": term, "limit": limit, "stage": stage,
+                "path": path, "exclude": exclude,})
+            return hole
+
+        monkeypatch.setattr(api, "dig", fake)
+        return calls
 
     return install
 
@@ -44,6 +52,57 @@ def test_limit_is_bounded(limit):
     response = client.get("/api/dig", params={"term": "car", "limit": limit})
 
     assert response.status_code == 422
+
+
+def test_stage_is_passed_through_and_echoed(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[], stage="candidates"))
+
+    body = client.get("/api/dig", params={"term": "car", "stage": "candidates"}).json()
+
+    assert calls[0]["stage"] == "candidates"
+    assert body["stage"] == "candidates"
+
+
+def test_unknown_stage_is_rejected_before_any_lookup(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    response = client.get("/api/dig", params={"term": "car", "stage": "vibes"})
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def test_visited_path_is_split_for_the_ranker(digs, entry):
+    calls = digs(Hole(term="bebop", top=entry("Bebop"), more=[]))
+
+    client.get("/api/dig", params={"term": "bebop", "path": "Jazz|Blues"})
+
+    assert calls[0]["path"] == ["Jazz", "Blues"]
+
+
+def test_empty_path_is_not_a_phantom_ancestor(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    client.get("/api/dig", params={"term": "car"})
+
+    assert calls[0]["path"] == []
+
+
+def test_exclusions_are_split_for_the_pool_filter(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    client.get(
+        "/api/dig", params={"term": "car", "exclude": "Ford Taurus|Mercury Sable"})
+
+    assert calls[0]["exclude"] == ["Ford Taurus", "Mercury Sable"]
+
+
+def test_blank_exclude_entries_are_discarded(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    client.get("/api/dig", params={"term": "car", "exclude": "Ford Taurus||  |"})
+
+    assert calls[0]["exclude"] == ["Ford Taurus"]
 
 
 def test_health_reports_the_version():
