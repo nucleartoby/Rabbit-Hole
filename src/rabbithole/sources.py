@@ -20,10 +20,9 @@ def _cache() -> sqlite3.Connection:
     return conn
 
 
-def _get_with_retry(params: dict, attempts: int = 3) -> dict:
+def _get_with_retry(api: str, params: dict, attempts: int = 3) -> dict:
     for attempt in range(attempts):
-        response = _session.get(
-            config.WIKIPEDIA_API, params=params, timeout=config.REQUEST_TIMEOUT)
+        response = _session.get(api, params=params, timeout=config.REQUEST_TIMEOUT)
         if response.status_code == 429 and attempt < attempts - 1:
             time.sleep(float(response.headers.get("Retry-After", 2**attempt)))
             continue
@@ -32,9 +31,10 @@ def _get_with_retry(params: dict, attempts: int = 3) -> dict:
     raise RuntimeError("unreachable")
 
 
-def _query(**params) -> dict:
+def _query(_api: str | None = None, **params) -> dict:
+    api = _api or config.WIKIPEDIA_API
     params = {"action": "query", "format": "json", "formatversion": 2, **params}
-    key = json.dumps(params, sort_keys=True)
+    key = json.dumps({"api": api, **params}, sort_keys=True)
 
     with _cache() as conn:
         row = conn.execute(
@@ -42,7 +42,7 @@ def _query(**params) -> dict:
         if row and time.time() - row[1] < config.CACHE_TTL:
             return json.loads(row[0])
 
-        body = _get_with_retry(params)
+        body = _get_with_retry(api, params)
         conn.execute(
             "INSERT OR REPLACE INTO responses VALUES (?, ?, ?)",
             (key, json.dumps(body), time.time()),)
@@ -114,6 +114,36 @@ def categories(titles: list[str]) -> dict[str, set[str]]:
             if "missing" not in page:
                 found[page["title"]] = {
                     category["title"] for category in page.get("categories", [])}
+
+    return found
+
+
+def qids(titles: list[str]) -> dict[str, str]:
+    found: dict[str, str] = {}
+
+    for batch in (titles[i : i + 20] for i in range(0, len(titles), 20)):
+        body = _query(
+            titles="|".join(batch), prop="pageprops", ppprop="wikibase_item", redirects=1)
+        for page in body.get("query", {}).get("pages", []):
+            item = (page.get("pageprops") or {}).get("wikibase_item")
+            if item:
+                found[page["title"]] = item
+
+    return found
+
+
+def entities(ids: list[str]) -> dict[str, dict]:
+    found: dict[str, dict] = {}
+
+    for batch in (ids[i : i + 50] for i in range(0, len(ids), 50)):
+        body = _query(
+            _api=config.WIKIDATA_API,
+            action="wbgetentities",
+            ids="|".join(batch),
+            props="claims",)
+        for qid, entity in (body.get("entities") or {}).items():
+            if "missing" not in entity:
+                found[qid] = entity.get("claims") or {}
 
     return found
 
