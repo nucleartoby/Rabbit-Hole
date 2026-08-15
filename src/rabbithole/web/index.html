@@ -45,8 +45,11 @@
     display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden;}
 
   .card.root p { -webkit-line-clamp: 10; color: #c3c3d4; }
-  .card footer { margin-top: 10px; display: flex; gap: 12px; align-items: center; font-size: 12px; }
+  .card footer { margin-top: 10px; display: flex; gap: 10px; align-items: center; font-size: 12px; }
   .card .count { color: var(--accent); }
+  .card .why {
+    padding: 1px 8px; border: 1px solid var(--edge); border-radius: 999px;
+    color: var(--muted); font-size: 11px; white-space: nowrap;}
   .card a { color: var(--muted); text-decoration: none; }
   .card a:hover { color: var(--ink); text-decoration: underline; }
   .card img { float: right; width: 74px; border-radius: 6px; margin: 0 0 8px 12px; }
@@ -107,6 +110,10 @@ let view = { x: innerWidth / 2, y: innerHeight / 2, scale: 1 };
 const RECENT_TREES = 2;
 const recentTrees = [];
 
+const clicked = [];
+const taste = () =>
+  clicked.length ? clicked.reduce((total, value) => total + value, 0) / clicked.length : null;
+
 const titleKey = title => title.replace(/_/g, ' ').trim().replace(/\s+/g, ' ').toLowerCase();
 
 function suppressed() {
@@ -124,13 +131,15 @@ function applyView() {
   world.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;}
 
 
-function addNode(entry, parent) {
+function addNode(entry, parent, parts) {
   const node = {
     ...entry,
     parent,
     depth: parent ? parent.depth + 1 : 0,
     children: [],
     open: false,
+    counted: false,
+    quantile: parts && typeof parts.quantile === 'number' ? parts.quantile : null,
     x: 0, y: 0,
   };
   nodes.push(node);
@@ -183,6 +192,12 @@ function makeCard(node) {
   p.textContent = node.summary || 'No summary available.';
 
   const footer = document.createElement('footer');
+  if (node.why) {
+    const why = document.createElement('span');
+    why.className = 'why';
+    why.textContent = node.why;
+    footer.appendChild(why);}
+
   const count = document.createElement('span');
   count.className = 'count';
   const link = document.createElement('a');
@@ -230,6 +245,10 @@ async function toggle(node) {
     draw();
     return;}
 
+  if (!node.counted && node.quantile !== null) {
+    clicked.push(node.quantile);
+    node.counted = true;}
+
   node.el.classList.add('loading');
   try {
     const hole = await fetchHole(node.title, 8, trail(node.parent), suppressed());
@@ -239,7 +258,7 @@ async function toggle(node) {
     for (const entry of hole.more) {
       if (!onCanvas.has(titleKey(entry.title))) {
         onCanvas.add(titleKey(entry.title));
-        addNode(entry, node);}}
+        addNode(entry, node, (hole.scores || {})[entry.title]);}}
 
     node.open = true;
     if (!node.children.length) status.textContent = `“${node.title}” is a dead end.`;
@@ -259,6 +278,8 @@ async function fetchHole(term, limit, path = [], exclude = []) {
   if (path.length) query.set('path', path.join('|'));
   if (exclude.length) query.set('exclude', exclude.join('|'));
   if (stageOverride) query.set('stage', stageOverride);
+  const aim = taste();
+  if (aim !== null) query.set('taste', aim.toFixed(4));
 
   const res = await fetch('/api/dig?' + query);
   if (!res.ok) throw new Error(`Nothing found for “${term}”.`);
@@ -275,6 +296,7 @@ async function search(term) {
   rememberTree();
   nodes.forEach(n => n.el.remove());
   nodes.length = 0;
+  clicked.length = 0;             // a new word is a new session, so taste starts over
 
   const root = addNode(hole.top, null);
   root.open = true;
@@ -282,7 +304,7 @@ async function search(term) {
   for (const entry of hole.more) {
     if (!seen.has(titleKey(entry.title))) {
       seen.add(titleKey(entry.title));
-      addNode(entry, root);}
+      addNode(entry, root, (hole.scores || {})[entry.title]);}
   }
   place(root);
   draw();
