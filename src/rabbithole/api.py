@@ -23,13 +23,16 @@ def api_dig(
     path: str = Query(
         default="", description="Titles already visited, '|' separated; steers novelty"),
     exclude: str = Query(
-        default="", description="Titles that must not be offered again, '|' separated"),) -> dict:
+        default="", description="Titles that must not be offered again, '|' separated"),
+    taste: float | None = Query(
+        default=None, ge=0.0, le=1.0,
+        description="Mean relevance quantile of what has been clicked; aims the band"),) -> dict:
     if stage is not None and stage not in relate.STAGES:
         raise HTTPException(status_code=422, detail=f"stage must be one of {relate.STAGES}")
 
     visited = [title for title in path.split("|") if title.strip()]
     blocked = [title for title in exclude.split("|") if title.strip()]
-    hole = dig(term, limit=limit, stage=stage, path=visited, exclude=blocked)
+    hole = dig(term, limit=limit, stage=stage, path=visited, exclude=blocked, taste=taste)
     if hole.top is None:
         raise HTTPException(status_code=404, detail=f"Nothing found for {term!r}")
 
