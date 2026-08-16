@@ -1,6 +1,6 @@
 from __future__ import annotations
 import argparse
-from rabbithole import config, core, metrics, relate, sources
+from rabbithole import config, core, labels, metrics, relate, sources
 
 DEFAULT_TERMS = ("car", "jazz", "penicillin", "the great depression", "octopus")
 
@@ -51,11 +51,11 @@ def walk(term: str, stage: str, limit: int, depth: int, breadth: int):
     return root_hole.top.summary, by_depth, seen
 
 
-def run(terms, limit, depth, breadth, backend):
+def run(terms, limit, depth, breadth, backend, stages, weights=None):
     results: dict[str, dict] = {}
 
-    for stage in relate.STAGES:
-        rows, samples = [], {}
+    for stage in stages:
+        rows, samples, reasons = [], {}, {}
         for term in terms:
             expansion, hole = expansion_for(term, stage, limit)
             if expansion is None:
@@ -63,29 +63,40 @@ def run(terms, limit, depth, breadth, backend):
 
             rows.append(metrics.score(expansion, backend=backend))
             samples[term] = [entry.title for entry in hole.more]
+            reasons[term] = [entry.why for entry in hole.more]
 
-        summary = metrics.aggregate(rows)
+        summary = metrics.aggregate(rows, weights)
 
         root_text, by_depth, seen = walk(terms[0], stage, limit, depth, breadth)
         summary["unique_rate"] = len(set(seen)) / len(seen) if seen else 0.0
+        summary["typed_rate"] = _typed_rate(reasons)
 
         results[stage] = {
             "summary": summary,
             "drift": metrics.drift(root_text, by_depth, backend=backend),
-            "samples": samples,}
+            "samples": samples,
+            "reasons": reasons,}
 
     return results
 
 
-def _table(results) -> str:
-    names = list(metrics.HIGHER_IS_BETTER) + ["unique_rate", "quality"]
+def _typed_rate(reasons: dict[str, list[str]]) -> float:
+    flat = [why for whys in reasons.values() for why in whys]
+    if not flat:
+        return 0.0
+
+    return sum(1 for why in flat if why) / len(flat)
+
+
+def _table(results, stages) -> str:
+    names = list(metrics.HIGHER_IS_BETTER) + ["unique_rate", "typed_rate", "quality"]
     width = max(len(name) for name in names) + 2
-    header = "metric".ljust(width) + "".join(stage.rjust(13) for stage in relate.STAGES)
+    header = "metric".ljust(width) + "".join(stage.rjust(13) for stage in stages)
     lines = [header, "-" * len(header)]
 
     for name in names:
         row = name.ljust(width)
-        for stage in relate.STAGES:
+        for stage in stages:
             row += f"{results[stage]['summary'].get(name, 0.0):13.3f}"
 
         if name in metrics.HIGHER_IS_BETTER:
@@ -94,28 +105,33 @@ def _table(results) -> str:
 
     lines.append("")
     lines.append("drift back to root, by depth")
-    for stage in relate.STAGES:
+    for stage in stages:
         drift = results[stage]["drift"]
         rendered = "  ".join(f"d{depth}={value:.3f}" for depth, value in drift.items())
         lines.append(f"  {stage.ljust(12)} {rendered or '(none)'}")
 
-    baseline = results[relate.SEARCH]["summary"].get("quality", 0.0)
+    baseline_stage = stages[0]
+    baseline = results[baseline_stage]["summary"].get("quality", 0.0)
     lines.append("")
-    for stage in relate.STAGES[1:]:
+    for stage in stages[1:]:
         current = results[stage]["summary"].get("quality", 0.0)
         delta = (current - baseline) / baseline * 100 if baseline else 0.0
-        lines.append(f"  quality {stage} vs {relate.SEARCH}: {delta:+.1f}%")
+        lines.append(f"  quality {stage} vs {baseline_stage}: {delta:+.1f}%")
 
     return "\n".join(lines)
 
 
-def _samples(results, terms) -> str:
+def _samples(results, terms, stages) -> str:
     lines = []
     for term in terms:
         lines.append(f"\n{term!r}")
-        for stage in relate.STAGES:
+        for stage in stages:
             picks = results[stage]["samples"].get(term, [])
-            lines.append(f"  {stage.ljust(12)} {', '.join(picks[:6]) or '(nothing)'}")
+            whys = results[stage]["reasons"].get(term, [])
+            rendered = ", ".join(
+                f"{pick} [{why}]" if why else pick
+                for pick, why in zip(picks[:6], (whys + [""] * 6)[:6], strict=False))
+            lines.append(f"  {stage.ljust(12)} {rendered or '(nothing)'}")
 
     return "\n".join(lines)
 
@@ -128,15 +144,31 @@ def main() -> None:
     parser.add_argument("--depth", type=int, default=2)
     parser.add_argument("--breadth", type=int, default=2)
     parser.add_argument("--backend", default=config.VECTOR_BACKEND)
+    parser.add_argument(
+        "--stages", default=",".join(relate.STAGES),
+        help=f"comma separated subset of {','.join(relate.STAGES)}")
+    parser.add_argument(
+        "--calibrated", action="store_true",
+        help="weight quality by what the recorded judgements support, not by hand")
     args = parser.parse_args()
 
     terms = [term.strip() for term in args.terms.split(",") if term.strip()]
-    results = run(terms, args.limit, args.depth, args.breadth, args.backend)
+    stages = [stage.strip() for stage in args.stages.split(",") if stage.strip()]
+    unknown = [stage for stage in stages if stage not in relate.STAGES]
+    if unknown:
+        parser.error(f"unknown stage(s) {unknown}; expected from {relate.STAGES}")
 
-    print(f"\nterms={len(terms)} limit={args.limit} backend={args.backend}\n")
-    print(_table(results))
+    calibration = metrics.calibrate(labels.load())
+    weights = calibration.weights if args.calibrated else None
+
+    results = run(terms, args.limit, args.depth, args.breadth, args.backend, stages, weights)
+
+    print(f"\nterms={len(terms)} limit={args.limit} backend={args.backend}")
+    print(f"quality weights: {'calibrated' if args.calibrated else 'hand-set'}")
+    print(f"calibration: {calibration.verdict()}\n")
+    print(_table(results, stages))
     print("\nwhat each stage actually offered")
-    print(_samples(results, terms))
+    print(_samples(results, terms, stages))
     print()
 
 
