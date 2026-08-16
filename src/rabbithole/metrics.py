@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from statistics import fmean
 import numpy as np
-from rabbithole import relate, vectors
+from rabbithole import labels, relate, vectors
 
 HIGHER_IS_BETTER = {
     "grounding": True,
@@ -22,6 +22,8 @@ QUALITY_WEIGHTS = {
     "link_grounding": 0.10,
     "yield_rate": 0.05,}
 
+MINIMUM_LABELS = 30
+TRUST_THRESHOLD = 0.5
 
 
 @dataclass
@@ -111,21 +113,26 @@ def score(expansion: Expansion, backend: str = "tfidf") -> dict[str, float]:
         **_vector_metrics(expansion, backend),}
 
 
-def quality(scored: dict[str, float]) -> float:
-    total = 0.0
-    for name, weight in QUALITY_WEIGHTS.items():
-        value = scored.get(name, 0.0)
-        total += weight * (value if HIGHER_IS_BETTER[name] else 1.0 - value)
-
-    return total
+def oriented(scored: dict[str, float]) -> dict[str, float]:
+    return {
+        name: (scored.get(name, 0.0) if higher else 1.0 - scored.get(name, 0.0))
+        for name, higher in HIGHER_IS_BETTER.items()}
 
 
-def aggregate(rows: list[dict[str, float]]) -> dict[str, float]:
+def quality(scored: dict[str, float], weights: dict[str, float] | None = None) -> float:
+    weights = weights or QUALITY_WEIGHTS
+    features = oriented(scored)
+
+    return sum(weight * features[name] for name, weight in weights.items())
+
+
+def aggregate(
+    rows: list[dict[str, float]], weights: dict[str, float] | None = None) -> dict[str, float]:
     if not rows:
         return {}
 
     summary = {name: fmean(row.get(name, 0.0) for row in rows) for name in HIGHER_IS_BETTER}
-    summary["quality"] = quality(summary)
+    summary["quality"] = quality(summary, weights)
 
     return summary
 
@@ -150,3 +157,98 @@ def _jaccard(left: set[str], right: set[str]) -> float:
         return 0.0
 
     return len(left & right) / len(left | right)
+
+
+@dataclass(frozen=True)
+class Calibration:
+
+    weights: dict[str, float]
+    agreement: float            # spearman fitted quality against human rating
+    baseline: float             # spearman hand-set weights against human rating
+    samples: int
+
+    @property
+    def trusted(self) -> bool:
+        return self.samples >= MINIMUM_LABELS and self.agreement >= TRUST_THRESHOLD
+
+    def verdict(self) -> str:
+        if self.samples < MINIMUM_LABELS:
+            return (
+                f"uncalibrated: {self.samples}/{MINIMUM_LABELS} judgements. "
+                "quality is a proxy nobody has checked; rank stages by it at your own risk")
+        if self.agreement < TRUST_THRESHOLD:
+            return (
+                f"calibrated on {self.samples} judgements but agreement is only "
+                f"{self.agreement:.2f}; the metrics do not capture what you are rating")
+
+        return (
+            f"calibrated on {self.samples} judgements, agreement {self.agreement:.2f} "
+            f"(hand-set weights scored {self.baseline:.2f})")
+
+
+def _ranks(values: np.ndarray) -> np.ndarray:
+    order = values.argsort()
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64)
+
+    for value in np.unique(values):
+        tied = values == value
+        if tied.sum() > 1:
+            ranks[tied] = ranks[tied].mean()
+
+    return ranks
+
+
+def spearman(left, right) -> float:
+    left, right = np.asarray(left, dtype=np.float64), np.asarray(right, dtype=np.float64)
+    if len(left) < 2 or len(left) != len(right):
+        return 0.0
+
+    a, b = _ranks(left), _ranks(right)
+    a, b = a - a.mean(), b - b.mean()
+    spread = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if spread < 1e-12:
+        return 0.0
+
+    return float(a @ b / spread)
+
+
+def _project_simplex(vector: np.ndarray) -> np.ndarray:
+    descending = np.sort(vector)[::-1]
+    cumulative = np.cumsum(descending)
+    indices = np.arange(1, len(vector) + 1)
+    supported = descending - (cumulative - 1.0) / indices > 0
+    rho = int(indices[supported][-1])
+    theta = (cumulative[rho - 1] - 1.0) / rho
+
+    return np.maximum(vector - theta, 0.0)
+
+
+def fit_weights(
+    matrix: np.ndarray, ratings: np.ndarray, steps: int = 4000, rate: float = 0.05) -> np.ndarray:
+    weights = np.full(matrix.shape[1], 1.0 / matrix.shape[1])
+
+    for _ in range(steps):
+        gradient = 2.0 * matrix.T @ (matrix @ weights - ratings) / len(ratings)
+        weights = _project_simplex(weights - rate * gradient)
+
+    return weights
+
+
+def calibrate(judgements: list[labels.Judgement]) -> Calibration:
+    usable = [judgement for judgement in judgements if judgement.scored]
+    names = list(HIGHER_IS_BETTER)
+    if len(usable) < 2:
+        return Calibration(dict(QUALITY_WEIGHTS), 0.0, 0.0, len(usable))
+
+    matrix = np.array(
+        [[oriented(judgement.scored)[name] for name in names] for judgement in usable])
+    ratings = np.array([judgement.rating for judgement in usable])
+    fitted = fit_weights(matrix, ratings)
+    hand_set = np.array([QUALITY_WEIGHTS[name] for name in names])
+
+    return Calibration(
+        weights={name: float(weight) for name, weight in zip(names, fitted, strict=True)},
+        agreement=spearman(matrix @ fitted, ratings),
+        baseline=spearman(matrix @ hand_set, ratings),
+        samples=len(usable),)
