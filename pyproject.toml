@@ -33,6 +33,8 @@ nlp = [
 
 [project.scripts]
 rabbithole = "rabbithole.__main__:main"
+rabbithole-bench = "rabbithole.bench:main"
+rabbithole-judge = "rabbithole.judge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rabbithole"]
@@ -44,6 +46,7 @@ extend-exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["I001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
