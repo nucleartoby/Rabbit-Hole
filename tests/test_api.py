@@ -11,10 +11,10 @@ def digs(monkeypatch):
     calls = []
 
     def install(hole):
-        def fake(term, limit, stage=None, path=None, exclude=None):
+        def fake(term, limit, stage=None, path=None, exclude=None, taste=None):
             calls.append({
                 "term": term, "limit": limit, "stage": stage,
-                "path": path, "exclude": exclude,})
+                "path": path, "exclude": exclude, "taste": taste,})
             return hole
 
         monkeypatch.setattr(api, "dig", fake)
@@ -103,6 +103,53 @@ def test_blank_exclude_entries_are_discarded(digs, entry):
     client.get("/api/dig", params={"term": "car", "exclude": "Ford Taurus||  |"})
 
     assert calls[0]["exclude"] == ["Ford Taurus"]
+
+
+def test_taste_is_passed_through_for_the_adaptive_band(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    client.get("/api/dig", params={"term": "car", "taste": 0.3})
+
+    assert calls[0]["taste"] == pytest.approx(0.3)
+
+
+def test_absent_taste_leaves_the_band_alone(digs, entry):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[]))
+
+    client.get("/api/dig", params={"term": "car"})
+
+    assert calls[0]["taste"] is None
+
+
+@pytest.mark.parametrize("taste", [-0.1, 1.4])
+def test_taste_is_bounded_to_a_quantile(taste):
+    response = client.get("/api/dig", params={"term": "car", "taste": taste})
+
+    assert response.status_code == 422
+
+
+def test_why_survives_serialisation(digs):
+    from rabbithole.core import Entry
+
+    digs(
+        Hole(
+            term="jazz",
+            top=Entry(title="Jazz", summary="s", url="u"),
+            more=[Entry(title="Bebop", summary="s", url="u", why="same movement")],))
+
+    body = client.get("/api/dig", params={"term": "jazz"}).json()
+
+    assert body["more"][0]["why"] == "same movement"
+
+
+@pytest.mark.parametrize("stage", ["session", "typed", "kge"])
+def test_new_stages_are_accepted(digs, entry, stage):
+    calls = digs(Hole(term="car", top=entry("Car"), more=[], stage=stage))
+
+    response = client.get("/api/dig", params={"term": "car", "stage": stage})
+
+    assert response.status_code == 200
+    assert calls[0]["stage"] == stage
 
 
 def test_health_reports_the_version():
