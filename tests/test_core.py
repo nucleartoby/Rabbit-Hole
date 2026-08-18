@@ -3,9 +3,20 @@ from rabbithole import core, relate, sources
 from rabbithole.core import dig
 
 
+def _claim(pid, value):
+    return {
+        "mainsnak": {
+            "snaktype": "value",
+            "property": pid,
+            "datavalue": {
+                "value": {"entity-type": "item", "id": value},
+                "type": "wikibase-entityid"},}}
+
+
 @pytest.fixture
 def wikipedia(monkeypatch):
-    def install(hits, detail, morelike=None, lead=None, categories=None):
+    def install(
+        hits, detail, morelike=None, lead=None, categories=None, qids=None, entities=None):
         monkeypatch.setattr(sources, "search", lambda term, limit: hits)
         monkeypatch.setattr(sources, "pages", lambda titles: detail)
         monkeypatch.setattr(
@@ -13,6 +24,8 @@ def wikipedia(monkeypatch):
         monkeypatch.setattr(sources, "lead_links", lambda title: lead or [])
         monkeypatch.setattr(
             sources, "categories", lambda titles: categories or {})
+        monkeypatch.setattr(sources, "qids", lambda titles: qids or {})
+        monkeypatch.setattr(sources, "entities", lambda ids: entities or {})
 
     return install
 
@@ -35,7 +48,9 @@ def test_best_match_leads_and_the_rest_follow(wikipedia):
 
 
 def test_falls_back_to_search_snippet_with_markup_stripped(wikipedia):
-    wikipedia(hits=[{"title": "Obscure", "snippet": 'an <span class="hit">obscure</span> thing'}], detail={},)
+    wikipedia(
+        hits=[{"title": "Obscure", "snippet": 'an <span class="hit">obscure</span> thing'}],
+        detail={},)
 
     hole = dig("obscure", stage=relate.SEARCH)
 
@@ -45,7 +60,10 @@ def test_falls_back_to_search_snippet_with_markup_stripped(wikipedia):
 
 
 def test_thumbnail_is_lifted_when_present(wikipedia):
-    wikipedia(hits=[{"title": "Car"}], detail={"Car": {"title": "Car", "extract": "x", "thumbnail": {"source": "img.jpg"}}},)
+    wikipedia(
+        hits=[{"title": "Car"}],
+        detail={
+            "Car": {"title": "Car", "extract": "x", "thumbnail": {"source": "img.jpg"}}},)
 
     assert dig("car", stage=relate.SEARCH).top.thumbnail == "img.jpg"
 
@@ -135,20 +153,21 @@ class TestExclusions:
             detail={t: {"title": t, "extract": f"Music about {t} and rhythm."} for t in titles},
             morelike=[{"title": t} for t in titles[1:]],)
 
-    @pytest.mark.parametrize("stage", [relate.SEARCH, relate.CANDIDATES, relate.RANKED])
+    @pytest.mark.parametrize("stage", relate.STAGES)
     def test_excluded_titles_are_never_offered(self, music, stage):
         hole = dig("jazz", stage=stage, exclude=["Blues", "Bebop"])
 
         assert {"Blues", "Bebop"}.isdisjoint(entry.title for entry in hole.more)
 
-    @pytest.mark.parametrize("stage", [relate.CANDIDATES, relate.RANKED])
+    @pytest.mark.parametrize(
+        "stage", [stage for stage in relate.STAGES if stage != relate.SEARCH])
     def test_a_blocked_slot_is_backfilled_not_left_empty(self, music, stage):
         full = dig("jazz", stage=stage, limit=3)
         trimmed = dig("jazz", stage=stage, limit=3, exclude=[full.more[0].title])
 
         assert len(trimmed.more) == len(full.more)
 
-    @pytest.mark.parametrize("stage", [relate.SEARCH, relate.CANDIDATES, relate.RANKED])
+    @pytest.mark.parametrize("stage", relate.STAGES)
     def test_the_searched_page_itself_survives_exclusion(self, music, stage):
         hole = dig("jazz", stage=stage, exclude=["Jazz"])
 
@@ -209,3 +228,183 @@ class TestRankedStage:
         assert all(
             {"band", "novelty", "grounding", "crowding"} <= set(parts)
             for parts in hole.scores.values())
+
+
+class TestSessionStage:
+
+    @pytest.fixture
+    def genres(self, wikipedia):
+        titles = ("Jazz", "Bebop", "Blues", "Ragtime", "Granite", "Basalt")
+        bodies = {
+            "Jazz": "Jazz is improvised music with swing and blue notes.",
+            "Bebop": "Bebop is fast jazz with complex chords and improvisation.",
+            "Blues": "Blues is music with a twelve bar form and blue notes.",
+            "Ragtime": "Ragtime is syncopated piano music from the era.",
+            "Granite": "Granite is a coarse grained intrusive igneous rock.",
+            "Basalt": "Basalt is a fine grained extrusive volcanic igneous rock.",}
+        wikipedia(
+            hits=[{"title": title} for title in titles],
+            detail={title: {"title": title, "extract": bodies[title]} for title in titles},
+            morelike=[{"title": title} for title in titles[1:]],)
+
+    def test_every_pick_carries_the_session_axes(self, genres):
+        hole = dig("jazz", stage=relate.SESSION, limit=3)
+
+        assert hole.more
+        assert all(
+            {"band", "drift", "novelty", "grounding", "crowding"} <= set(parts)
+            for parts in hole.scores.values())
+
+    def test_the_quantile_that_feeds_taste_is_reported(self, genres):
+        hole = dig("jazz", stage=relate.SESSION, limit=3)
+
+        assert all(0.0 <= parts["quantile"] <= 1.0 for parts in hole.scores.values())
+
+    def test_where_the_reader_has_been_changes_what_is_offered(self, genres):
+        cold = dig("jazz", stage=relate.SESSION, limit=3)
+        warm = dig("jazz", stage=relate.SESSION, limit=3, path=["Granite", "Basalt"])
+
+        assert [e.title for e in cold.more] != [e.title for e in warm.more]
+
+    def test_taste_changes_what_is_offered(self, genres):
+        near = dig("jazz", stage=relate.SESSION, limit=3, taste=0.05)
+        far = dig("jazz", stage=relate.SESSION, limit=3, taste=0.95)
+
+        assert [e.title for e in near.more] != [e.title for e in far.more]
+
+    def test_a_walk_with_no_history_still_works(self, genres):
+        assert dig("jazz", stage=relate.SESSION, limit=3, path=[]).more
+
+
+class TestPathTexts:
+
+    def test_visited_summaries_come_back_oldest_first(self, monkeypatch):
+        monkeypatch.setattr(
+            sources, "pages",
+            lambda titles: {
+                "Blues": {"title": "Blues", "extract": "second"},
+                "Jazz": {"title": "Jazz", "extract": "first"},},)
+
+        assert core._path_texts(["Jazz", "Blues"]) == ["first", "second"]
+
+    def test_a_redirected_title_is_matched_back_onto_the_walk(self, monkeypatch):
+        monkeypatch.setattr(
+            sources, "pages",
+            lambda titles: {"Cable car": {"title": "Cable car", "extract": "cable"}},)
+
+        assert core._path_texts(["cable_car"]) == ["cable"]
+
+    def test_a_page_the_walk_cannot_be_matched_to_is_kept_not_dropped(self, monkeypatch):
+        monkeypatch.setattr(
+            sources, "pages",
+            lambda titles: {
+                "Jazz": {"title": "Jazz", "extract": "first"},
+                "Automobile": {"title": "Automobile", "extract": "redirected away"},},)
+
+        assert core._path_texts(["Jazz"]) == ["first", "redirected away"]
+
+    def test_an_empty_walk_asks_wikipedia_nothing(self, monkeypatch):
+        def explode(titles):
+            raise AssertionError("should not have been called")
+
+        monkeypatch.setattr(sources, "pages", explode)
+
+        assert core._path_texts([]) == []
+
+
+class TestTypedStage:
+
+    @pytest.fixture
+    def jazz(self, wikipedia):
+        titles = ("Jazz", "Bebop", "Blues", "Granite")
+        wikipedia(
+            hits=[{"title": title} for title in titles],
+            detail={
+                title: {"title": title, "extract": f"About {title} and its history."}
+                for title in titles},
+            morelike=[{"title": title} for title in titles[1:]],
+            qids={
+                "Jazz": "Q8341", "Bebop": "Q170972", "Blues": "Q9759", "Granite": "Q43338"},
+            entities={
+                "Q8341": {"P136": [_claim("P136", "Q638")]},
+                "Q170972": {"P279": [_claim("P279", "Q8341")]},
+                "Q9759": {"P136": [_claim("P136", "Q638")]},
+                "Q43338": {"P31": [_claim("P31", "Q10931")]},},)
+
+    def test_a_relation_is_explained_on_the_card(self, jazz):
+        hole = dig("jazz", stage=relate.TYPED, limit=3)
+        why = {entry.title: entry.why for entry in hole.more}
+
+        assert why.get("Bebop") == "a kind of"
+        assert why.get("Blues") == "same genre"
+
+    def test_an_untyped_candidate_says_nothing_rather_than_guessing(self, jazz):
+        hole = dig("jazz", stage=relate.TYPED, limit=4)
+        why = {entry.title: entry.why for entry in hole.more}
+
+        assert why.get("Granite", "") == ""
+
+    def test_variety_is_weighed_alongside_the_rest(self, jazz):
+        hole = dig("jazz", stage=relate.TYPED, limit=3)
+
+        assert all("variety" in parts for parts in hole.scores.values())
+
+    def test_wikidata_knowing_nothing_degrades_to_an_untyped_ranking(self, wikipedia):
+        titles = ("Jazz", "Bebop", "Blues")
+        wikipedia(
+            hits=[{"title": title} for title in titles],
+            detail={
+                title: {"title": title, "extract": f"About {title} and rhythm."}
+                for title in titles},
+            morelike=[{"title": title} for title in titles[1:]],)
+
+        hole = dig("jazz", stage=relate.TYPED, limit=2)
+
+        assert len(hole.more) == 2
+        assert all(entry.why == "" for entry in hole.more)
+
+
+class TestKgeStage:
+
+    @pytest.fixture
+    def graphed(self, wikipedia):
+        titles = ("Jazz", "Bebop", "Blues", "Granite", "Basalt")
+        wikipedia(
+            hits=[{"title": title} for title in titles],
+            detail={
+                title: {"title": title, "extract": f"About {title} and its history."}
+                for title in titles},
+            morelike=[{"title": title} for title in titles[1:]],
+            qids={
+                "Jazz": "Q1", "Bebop": "Q2", "Blues": "Q3", "Granite": "Q4", "Basalt": "Q5"},
+            entities={
+                "Q1": {"P136": [_claim("P136", "Q90")], "P135": [_claim("P135", "Q91")]},
+                "Q2": {"P136": [_claim("P136", "Q90")], "P135": [_claim("P135", "Q91")]},
+                "Q3": {"P136": [_claim("P136", "Q90")]},
+                "Q4": {"P31": [_claim("P31", "Q92")], "P17": [_claim("P17", "Q93")]},
+                "Q5": {"P31": [_claim("P31", "Q92")], "P17": [_claim("P17", "Q93")]},},)
+
+    def test_the_graph_signal_reaches_the_scores(self, graphed):
+        hole = dig("jazz", stage=relate.KGE, limit=3)
+
+        assert hole.more
+        assert all("structural" in parts for parts in hole.scores.values())
+
+    def test_it_still_explains_itself_like_the_typed_stage(self, graphed):
+        hole = dig("jazz", stage=relate.KGE, limit=4)
+
+        assert any(entry.why for entry in hole.more)
+
+    def test_an_ungraphed_expansion_falls_back_without_complaint(self, wikipedia):
+        titles = ("Jazz", "Bebop", "Blues")
+        wikipedia(
+            hits=[{"title": title} for title in titles],
+            detail={
+                title: {"title": title, "extract": f"About {title} and rhythm."}
+                for title in titles},
+            morelike=[{"title": title} for title in titles[1:]],)
+
+        hole = dig("jazz", stage=relate.KGE, limit=2)
+
+        assert len(hole.more) == 2
+        assert all(parts["structural"] == 0.5 for parts in hole.scores.values())
