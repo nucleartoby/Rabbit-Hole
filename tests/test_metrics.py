@@ -1,5 +1,6 @@
+import numpy as np
 import pytest
-from rabbithole import metrics, relate, vectors
+from rabbithole import labels, metrics, relate, vectors
 
 
 def expansion(parent, picks, **kwargs):
@@ -130,6 +131,130 @@ class TestQuality:
     def test_weights_cover_every_metric_exactly_once(self):
         assert set(metrics.QUALITY_WEIGHTS) == set(metrics.HIGHER_IS_BETTER)
         assert sum(metrics.QUALITY_WEIGHTS.values()) == pytest.approx(1.0)
+
+
+def judged(rating, **scored):
+    baseline = dict.fromkeys(metrics.HIGHER_IS_BETTER, 0.5)
+    return labels.Judgement(
+        parent="Jazz", picks=["Bebop"], rating=rating, scored=baseline | scored)
+
+
+class TestOrientation:
+
+    def test_a_penalty_metric_is_flipped_and_a_reward_metric_is_not(self):
+        features = metrics.oriented({"lexical_leak": 0.25, "grounding": 0.25})
+
+        assert features["lexical_leak"] == 0.75
+        assert features["grounding"] == 0.25
+
+    def test_a_missing_metric_reads_as_its_worst_value(self):
+        features = metrics.oriented({})
+
+        assert features["grounding"] == 0.0
+        assert features["lexical_leak"] == 1.0
+
+
+class TestSpearman:
+
+    @pytest.mark.parametrize(
+        "right,expected", [([1, 2, 3, 4], 1.0), ([4, 3, 2, 1], -1.0)])
+    def test_monotone_agreement_reads_plus_or_minus_one(self, right, expected):
+        assert metrics.spearman([1, 2, 3, 4], right) == pytest.approx(expected)
+
+    def test_it_is_rank_based_so_scale_does_not_matter(self):
+        assert metrics.spearman([1, 2, 3], [10, 1000, 100000]) == pytest.approx(1.0)
+
+    def test_a_flat_series_agrees_with_nothing(self):
+        assert metrics.spearman([1, 1, 1], [1, 2, 3]) == 0.0
+
+    @pytest.mark.parametrize("left", [[], [1], [1, 2, 3]])
+    def test_too_little_or_mismatched_data_is_zero_not_a_guess(self, left):
+        assert metrics.spearman(left, [1, 2]) == 0.0
+
+
+class TestFitWeights:
+
+    def test_weights_stay_on_the_simplex(self):
+        rng = np.random.default_rng(0)
+        matrix = rng.random((25, 4))
+        fitted = metrics.fit_weights(matrix, rng.random(25))
+
+        assert fitted.sum() == pytest.approx(1.0)
+        assert (fitted >= 0.0).all()
+
+    def test_the_feature_that_drives_the_rating_takes_the_weight(self):
+        values = np.linspace(0.0, 1.0, 20)
+        matrix = np.column_stack([values, np.full(20, 0.5)])
+
+        fitted = metrics.fit_weights(matrix, values)
+
+        assert fitted[0] > 0.9
+
+
+class TestCalibration:
+
+    def test_it_says_so_when_nobody_has_judged_anything(self):
+        calibration = metrics.calibrate([])
+
+        assert not calibration.trusted
+        assert "uncalibrated" in calibration.verdict()
+        assert calibration.weights == metrics.QUALITY_WEIGHTS
+
+    def test_a_handful_of_labels_is_still_not_a_calibration(self):
+        calibration = metrics.calibrate([judged(v) for v in np.linspace(0, 1, 5)])
+
+        assert calibration.samples == 5
+        assert not calibration.trusted
+        assert f"5/{metrics.MINIMUM_LABELS}" in calibration.verdict()
+
+    def test_it_catches_hand_set_weights_pointing_the_wrong_way(self):
+        values = np.linspace(0.0, 1.0, 40) # Rating tracks yield
+        judgements = [judged(v, yield_rate=v, lexical_leak=v) for v in values]
+
+        calibration = metrics.calibrate(judgements)
+
+        assert calibration.baseline < 0.0
+        assert calibration.agreement > 0.9
+        assert calibration.weights["yield_rate"] > metrics.QUALITY_WEIGHTS["yield_rate"]
+
+    def test_enough_agreeing_labels_earns_trust(self):
+        values = np.linspace(0.0, 1.0, metrics.MINIMUM_LABELS)
+        calibration = metrics.calibrate([judged(v, grounding=v) for v in values])
+
+        assert calibration.trusted
+        assert "calibrated on" in calibration.verdict()
+
+    def test_labels_that_agree_with_nothing_are_not_trusted(self):
+        ratings = [0.0, 1.0] * 20
+        judgements = [
+            judged(rating, grounding=value)
+            for rating, value in zip(ratings, np.linspace(0, 1, 40), strict=True)]
+
+        calibration = metrics.calibrate(judgements)
+
+        assert calibration.samples == 40
+        assert not calibration.trusted
+        assert "do not capture" in calibration.verdict()
+
+    def test_judgements_without_stored_metrics_cannot_calibrate_anything(self):
+        calibration = metrics.calibrate(
+            [labels.Judgement(parent="Jazz", picks=[], rating=1.0) for _ in range(40)])
+
+        assert calibration.samples == 0
+        assert not calibration.trusted
+
+
+class TestQualityWeighting:
+
+    def test_calibrated_weights_can_replace_the_hand_set_ones(self):
+        scored = dict.fromkeys(metrics.HIGHER_IS_BETTER, 0.0) | {"yield_rate": 1.0}
+
+        assert metrics.quality(scored) < metrics.quality(scored, {"yield_rate": 1.0})
+
+    def test_aggregate_honours_the_weights_it_is_given(self):
+        rows = [dict.fromkeys(metrics.HIGHER_IS_BETTER, 0.0) | {"grounding": 1.0}]
+
+        assert metrics.aggregate(rows, {"grounding": 1.0})["quality"] == pytest.approx(1.0)
 
 
 class TestCategoryAffinity:
